@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,18 +22,22 @@ func main() {
 	lb := &LoadBalancer{backends: backends}
 	lb.StartHealthCheck(time.Second * 10)
 
-	//server
+	mux := http.NewServeMux()
+	mux.Handle("/", configureReverseProxy(lb))
+	mux.Handle("POST /admin/change-algorithm", lb)
+
 	log.Println("load balancer on: 8000")
-	log.Fatal(http.ListenAndServe(":8000", configureReverseProxy(lb)))
+	log.Fatal(http.ListenAndServe(":8000", mux))
 }
 
 // ==============================================================================
 // Backend
 type Backend struct {
-	URL          string
-	Healthy      bool
-	mu           sync.RWMutex
-	failureCount int
+	URL               string
+	Healthy           bool
+	mu                sync.RWMutex
+	failureCount      int
+	ActiveConnections int64
 }
 
 func (b *Backend) IsHealthy() bool {
@@ -66,32 +72,48 @@ func (b *Backend) IncrementFailure() {
 // Load Balancer
 
 type LoadBalancer struct {
-	backends []*Backend
-	index    int
-	mu       sync.Mutex
+	backends  []*Backend
+	index     int
+	mu        sync.Mutex
+	algorithm BalancerAlgorithm
 }
 
-// NextBackend for now uses "round-robin" to cycle through backends and return the healthy ones.
+func (lb *LoadBalancer) SetAlgorithm(algo BalancerAlgorithm) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.algorithm = algo
+	log.Printf("changed the algorithm to %s\n", algo.Name())
+}
+
+// NextBackend for now uses "round-robin/least-connection" to cycle through backends and return the healthy ones.
 func (lb *LoadBalancer) NextBackend() *Backend {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
-	start := lb.index
-	for {
-		backend := lb.backends[lb.index]
-		//calculate next index
-		lb.index = (lb.index + 1) % len(lb.backends)
-
-		//check if the backend is healthy
-		if backend.IsHealthy() {
-			return backend
-		}
-
-		//if the idx is back to where we start, means we do not have a healthy one
-		if lb.index == start {
-			return nil
-		}
+	if lb.algorithm == nil {
+		//default is round robin
+		lb.algorithm = &RoundRobin{}
 	}
+
+	return lb.algorithm.NextBackend(lb.backends)
+}
+
+func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/change-algorithm" && r.Method == http.MethodPost {
+		algorithm := r.URL.Query().Get("algorithm")
+		switch algorithm {
+		case "round-robin":
+			lb.algorithm = &RoundRobin{}
+		case "least-connection":
+			lb.algorithm = &LeastConnection{}
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+	//not-found
+	w.WriteHeader(http.StatusNotFound)
 }
 
 // StartHealthCheck checks the health of each backend periodically and marks that backend as unhealthy if resp fails.
@@ -137,6 +159,8 @@ func configureReverseProxy(lb *LoadBalancer) http.Handler {
 				//invalid URL to force the error
 				r.URL = &url.URL{}
 			} else {
+				//now we add to its connections
+				atomic.AddInt64(&backend.ActiveConnections, 1)
 				ctx = context.WithValue(ctx, backendKey, backend)
 				target, _ := url.Parse(backend.URL)
 				r.URL.Scheme = target.Scheme
@@ -170,6 +194,8 @@ func configureReverseProxy(lb *LoadBalancer) http.Handler {
 		ModifyResponse: func(resp *http.Response) error {
 			if backendValue := resp.Request.Context().Value(backendKey); backendValue != nil {
 				backend := backendValue.(*Backend)
+				//reduce one active connection from this backend
+				atomic.AddInt64(&backend.ActiveConnections, -1)
 				//log a simple message
 				log.Printf("request to %s, succeeded\n", backend.URL)
 			}
@@ -189,4 +215,68 @@ func configureReverseProxy(lb *LoadBalancer) http.Handler {
 			ExpectContinueTimeout: time.Second * 1,
 		},
 	}
+}
+
+//==============================================================================
+// Balancer Algorithm
+
+type BalancerAlgorithm interface {
+	NextBackend(backends []*Backend) *Backend
+	Name() string
+}
+
+//==============================================================================
+// Round Robin
+
+type RoundRobin struct {
+	mu    sync.Mutex
+	index int
+}
+
+func (rr *RoundRobin) NextBackend(backends []*Backend) *Backend {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	start := rr.index
+	for {
+		backend := backends[rr.index]
+		rr.index = (rr.index + 1) % (len(backends))
+		if backend.IsHealthy() {
+			return backend
+		}
+
+		if start == rr.index {
+			return nil
+		}
+	}
+}
+
+func (rr *RoundRobin) Name() string {
+	return "round-robin"
+}
+
+//==============================================================================
+// Least connection
+
+type LeastConnection struct{}
+
+func (lc *LeastConnection) NextBackend(backends []*Backend) *Backend {
+	var best *Backend
+	min := int64(math.MaxInt64)
+
+	for _, backend := range backends {
+		if !backend.IsHealthy() {
+			continue
+		}
+
+		if conns := atomic.LoadInt64(&backend.ActiveConnections); conns < min {
+			min = conns
+			best = backend
+		}
+	}
+	return best
+}
+
+func (lc *LeastConnection) Name() string {
+	return "least-connection"
 }
